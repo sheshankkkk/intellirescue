@@ -1,60 +1,78 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score
-from xgboost import XGBClassifier
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+import numpy as np
+
+# Path to your CSV (the one you put in data/)
+CSV_PATH = "data/flood_data.csv"  # this is actually your traffic dataset
 
 
-def load_data(path: str) -> pd.DataFrame:
+def load_and_featurize(path: str) -> pd.DataFrame:
     """
-    Loads the flood dataset from a CSV file.
-
-    Expected to have:
-      - feature columns (e.g., Rainfall, Temperature, etc.)
-      - target column named 'flood' (0/1)
+    Loads the traffic dataset and creates time-based features from DateTime.
+    Expected columns: DateTime, Junction, Vehicles, ID
     """
     df = pd.read_csv(path)
+
+    # Parse DateTime column
+    df["DateTime"] = pd.to_datetime(df["DateTime"])
+
+    # Time-based features
+    df["hour"] = df["DateTime"].dt.hour
+    df["dayofweek"] = df["DateTime"].dt.dayofweek  # 0=Mon
+    df["month"] = df["DateTime"].dt.month
+    df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)  # Sat/Sun
+
+    # Drop columns we don't want as features
+    df = df.drop(columns=["DateTime", "ID"])
+
     return df
 
 
-def train_risk_model(csv_path: str = "data/flood_data.csv"):
-    # Load dataset
-    df = load_data(csv_path)
+def train_traffic_model(csv_path: str = CSV_PATH):
+    """
+    Trains a Random Forest regression model to predict Vehicles
+    (traffic volume) based on time and junction features.
+    """
+    df = load_and_featurize(csv_path)
 
-    # TODO: replace with real column names once dataset is added
-    feature_cols = [c for c in df.columns if c not in ["flood"]]
-    X = df[feature_cols]
-    y = df["flood"]
+    # Target: Vehicles
+    y = df["Vehicles"]
+    X = df.drop(columns=["Vehicles"])
 
+    # Train/test split
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.2, random_state=42
     )
 
-    model = XGBClassifier(
+    # Random Forest model
+    model = RandomForestRegressor(
         n_estimators=200,
-        max_depth=4,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        max_depth=None,
         random_state=42,
-        eval_metric="logloss",
+        n_jobs=-1,
     )
 
     model.fit(X_train, y_train)
 
+    # Predictions
     y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
 
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_proba)
+    # Metrics
+    mae = mean_absolute_error(y_test, y_pred)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
 
-    print("=== IntelliRescue Risk Model (Phase 1) ===")
-    print(f"Accuracy: {acc:.3f}")
-    print(f"ROC-AUC : {auc:.3f}")
+    print("=== Traffic Flow Prediction Model (Random Forest) ===")
+    print(f"Features used   : {list(X.columns)}")
+    print(f"MAE             : {mae:.3f} vehicles")
+    print(f"RMSE            : {rmse:.3f} vehicles")
+    print(f"R^2             : {r2:.3f}")
 
     return model
 
 
 if __name__ == "__main__":
-    print("Risk model skeleton ready. Plug in dataset next phase.")
-    # Later: train_risk_model()
-
+    train_traffic_model()
