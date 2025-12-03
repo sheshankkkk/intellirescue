@@ -81,7 +81,7 @@ def load_and_prepare_data():
     # One-hot encode categorical features
     X_encoded = pd.get_dummies(X_raw, drop_first=True)
 
-    # 🔥 IMPORTANT FIX: force everything to numeric and fill NaNs
+    # Ensure everything is numeric and no NaNs
     X_encoded = X_encoded.apply(pd.to_numeric, errors="coerce").fillna(0)
 
     print(f"[NN] Feature dimension after encoding: {X_encoded.shape[1]}")
@@ -111,6 +111,7 @@ def load_and_prepare_data():
         np.isnan(X_test_scaled).any(),
     )
 
+    # Also return y_train distribution so we can compute class weights
     return (
         X_train_scaled,
         X_val_scaled,
@@ -168,6 +169,17 @@ def train_nn_model(epochs: int = 50, batch_size: int = 256):
         scaler,
     ) = load_and_prepare_data()
 
+    # 👉 CLASS WEIGHTS for imbalance
+    unique, counts = np.unique(y_train, return_counts=True)
+    class_counts = dict(zip(unique, counts))
+    n0 = class_counts.get(0, 1)
+    n1 = class_counts.get(1, 1)
+    weight_for_1 = n0 / n1  # higher if class 1 is rare
+
+    class_weight = {0: 1.0, 1: weight_for_1}
+    print(f"[NN] Class counts (train): 0 → {n0}, 1 → {n1}")
+    print(f"[NN] Using class weights: {class_weight}")
+
     input_dim = X_train.shape[1]
     model = build_model(input_dim)
 
@@ -190,16 +202,13 @@ def train_nn_model(epochs: int = 50, batch_size: int = 256):
         batch_size=batch_size,
         callbacks=[es],
         verbose=1,
+        class_weight=class_weight,  # 💥 key change
     )
 
     # Evaluate on test set
     y_proba = model.predict(X_test).ravel()
-    # DEBUG: check for NaNs
     print("[NN] Any NaNs in y_proba?", np.isnan(y_proba).any())
-
-    # Guard in case something is still wrong
     if np.isnan(y_proba).any():
-        # Replace NaNs with mean probability to avoid metric crash
         mean_proba = np.nanmean(y_proba)
         y_proba = np.where(np.isnan(y_proba), mean_proba, y_proba)
 
@@ -209,7 +218,7 @@ def train_nn_model(epochs: int = 50, batch_size: int = 256):
     auc = roc_auc_score(y_test, y_proba)
     brier = brier_score_loss(y_test, y_proba)
 
-    print("\n=== INTELLIRESCUE: NEURAL DISASTER RISK MODEL ===")
+    print("\n=== INTELLIRESCUE: NEURAL DISASTER RISK MODEL (CLASS-WEIGHTED) ===")
     print(f"Impact column     : {IMPACT_COL} (threshold={threshold:.2f})")
     print(f"Epochs (attempted): {epochs}")
     print(f"Test Accuracy     : {acc:.3f}")
@@ -229,6 +238,7 @@ def train_nn_model(epochs: int = 50, batch_size: int = 256):
         "high_impact_quantile": float(HIGH_IMPACT_QUANTILE),
         "scaler_mean": scaler.mean_.tolist(),
         "scaler_scale": scaler.scale_.tolist(),
+        "class_weight": class_weight,
     }
     meta_path = os.path.join(MODEL_DIR, "disaster_nn_meta.json")
     pd.Series(meta).to_json(meta_path)
