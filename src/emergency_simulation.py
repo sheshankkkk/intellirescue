@@ -206,6 +206,12 @@ def run_simulation():
             f"\nCoverage rate             : {result['coverage_rate']:.3f}"
         )
 
+        os.makedirs("logs/simulation", exist_ok=True)
+    results_df = pd.DataFrame([naive_result, risk_aware_result])
+    results_path = "logs/simulation/emergency_simulation_results.csv"
+    results_df.to_csv(results_path, index=False)
+    print(f"\nSaved simulation results → {results_path}")
+
 
 if __name__ == "__main__":
     run_simulation()
