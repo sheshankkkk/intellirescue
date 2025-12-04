@@ -20,9 +20,9 @@ def get_data_path():
     if os.path.exists(CSV_PATH_FULL):
         print(f"[APP] Using FULL dataset at {CSV_PATH_FULL}")
         return CSV_PATH_FULL
-    elif os.path.exists(CSV_PATH_SAMPLE):
-        print(f"[APP] Using SAMPLE dataset at {CSV_PATH_SAMPLE}")
-        return CSV_PATH_SAMPLE
+    elif os.path.exists(CV_PATH_SAMPLE := CSV_PATH_SAMPLE):
+        print(f"[APP] Using SAMPLE dataset at {CV_PATH_SAMPLE}")
+        return CV_PATH_SAMPLE
     else:
         raise FileNotFoundError(
             f"Neither {CSV_PATH_FULL} nor {CSV_PATH_SAMPLE} found."
@@ -447,6 +447,13 @@ INDEX_HTML = """
             .layout { grid-template-columns: minmax(0,1fr); }
             .page { padding: 18px 12px 32px; }
         }
+        a {
+            color: #f97316;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
@@ -535,7 +542,7 @@ INDEX_HTML = """
                 </div>
             </div>
 
-            <!-- RIGHT: Historical insights + simulation -->
+            <!-- RIGHT: Historical insights + simulation + emergency resources -->
             <div>
                 <div class="card">
                     <h2 class="card-title">REGION RISK SNAPSHOT</h2>
@@ -566,41 +573,6 @@ INDEX_HTML = """
                     {% else %}
                         <p>No historical stats available for this region.</p>
                     {% endif %}
-                </div>
-
-                <div class="card" style="margin-top:14px;">
-                    <h2 class="card-title">TOP HIGH-RISK REGIONS</h2>
-                    <p class="card-subtitle">
-                        Ranked by fraction of disasters that historically became high-impact.
-                    </p>
-                    <p>
-                        <button type="button"
-                                id="toggle-top-btn"
-                                class="btn btn-secondary"
-                                onclick="toggleSection('top-regions','toggle-top-btn','Show high-risk regions','Hide high-risk regions')">
-                            Show high-risk regions
-                        </button>
-                    </p>
-                    <div id="top-regions" style="display:none;">
-                        <table>
-                            <tr>
-                                <th>Rank</th>
-                                <th>Region</th>
-                                <th>Events</th>
-                                <th>High-impact</th>
-                                <th>Rate</th>
-                            </tr>
-                            {% for row in top_regions %}
-                                <tr>
-                                    <td>{{ loop.index }}</td>
-                                    <td>{{ row.Region }}</td>
-                                    <td>{{ row.events }}</td>
-                                    <td>{{ row.high_impact }}</td>
-                                    <td>{{ "%.1f"|format(row.risk_rate * 100) }}%</td>
-                                </tr>
-                            {% endfor %}
-                        </table>
-                    </div>
                 </div>
 
                 <div class="card" style="margin-top:14px;">
@@ -700,6 +672,52 @@ INDEX_HTML = """
                         </div>
                         {% endif %}
                     </div>
+                </div>
+
+                <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">EMERGENCY RESPONSE RESOURCES</h2>
+                    <p class="card-subtitle">
+                        Practical guidance that emergency planners and citizens can use alongside IntelliRescue’s
+                        predictions. This content is generic – it should be adapted to your city / campus guidelines.
+                    </p>
+
+                    <h3 style="margin-top:4px; margin-bottom:4px; font-size:0.9rem;">Before a disaster (Preparedness)</h3>
+                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                        <li>Create a basic emergency kit: water, non-perishable food, torch, power bank, first-aid box, essential medicines, copies of ID cards.</li>
+                        <li>Keep a small “grab-and-go” bag ready near the door for fast evacuation.</li>
+                        <li>Agree on a common family / team meeting point if phones stop working.</li>
+                        <li>Save local emergency numbers and nearby hospital numbers on your phone.</li>
+                    </ul>
+
+                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">During a disaster (Immediate response)</h3>
+                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                        <li>Follow official warnings and evacuation orders – do not wait “to confirm” if the area is marked high risk.</li>
+                        <li>Flooding: avoid walking or driving through water; even shallow fast water can sweep vehicles away.</li>
+                        <li>Earthquakes: <b>Drop, Cover, Hold On</b> – drop low, cover your head and neck, hold onto sturdy furniture away from windows.</li>
+                        <li>Fire / smoke: stay low, cover your nose and mouth with cloth, exit by stairs (never lifts), and close doors behind you.</li>
+                    </ul>
+
+                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">After a disaster</h3>
+                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                        <li>Check yourself and others for injuries; call emergency services for serious injuries.</li>
+                        <li>Stay away from damaged buildings, fallen electric lines, and unstable bridges.</li>
+                        <li>Use SMS / data messages instead of phone calls to avoid overloading networks.</li>
+                        <li>Listen to local authorities for information about safe shelters, medical camps, and relief distribution.</li>
+                    </ul>
+
+                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">Important contacts (to customise)</h3>
+                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                        <li><b>Local emergency number:</b> 1 0 X (example – replace with your country’s number).</li>
+                        <li><b>City disaster control room:</b> add phone and email for your city / campus.</li>
+                        <li><b>Nearest major hospital:</b> add at least 2–3 hospital contacts.</li>
+                        <li><b>College / organisation helpline:</b> add your institute’s emergency contact.</li>
+                    </ul>
+
+                    <p style="margin-top:8px; font-size:0.8rem; color:#9ca3af;">
+                        IntelliRescue can highlight <span class="highlight">where</span> high-impact events are likely.
+                        These emergency response guidelines help decide <span class="highlight">how people and teams should react</span>
+                        when a warning is issued.
+                    </p>
                 </div>
             </div>
         </div>
