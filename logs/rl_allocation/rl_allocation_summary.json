@@ -1,0 +1,76 @@
+{
+  "n_steps": 50000,
+  "epsilon": 0.1,
+  "avg_reward_final": 0.18276,
+  "top_regions_by_Q": [
+    {
+      "rank": 1,
+      "region": "Southern Asia",
+      "Q": 0.19959766557609027,
+      "true_risk_rate": 0.45079950799507995
+    },
+    {
+      "rank": 2,
+      "region": "Eastern Asia",
+      "Q": 0.10999999999999993,
+      "true_risk_rate": 0.27340513670256833
+    },
+    {
+      "rank": 3,
+      "region": "South-Eastern Asia",
+      "Q": 0.09795918367346944,
+      "true_risk_rate": 0.2762312633832976
+    },
+    {
+      "rank": 4,
+      "region": "South America",
+      "Q": 0.06829268292682927,
+      "true_risk_rate": 0.24203821656050956
+    },
+    {
+      "rank": 5,
+      "region": "Western Africa",
+      "Q": 0.049999999999999996,
+      "true_risk_rate": 0.33783783783783783
+    },
+    {
+      "rank": 6,
+      "region": "Middle Africa",
+      "Q": 0.028301886792452827,
+      "true_risk_rate": 0.36482084690553745
+    },
+    {
+      "rank": 7,
+      "region": "Central America",
+      "Q": 0.02521008403361345,
+      "true_risk_rate": 0.16023166023166024
+    },
+    {
+      "rank": 8,
+      "region": "Eastern Africa",
+      "Q": 0.02118644067796611,
+      "true_risk_rate": 0.27698309492847856
+    },
+    {
+      "rank": 9,
+      "region": "Eastern Europe",
+      "Q": 0.01932367149758455,
+      "true_risk_rate": 0.1762917933130699
+    },
+    {
+      "rank": 10,
+      "region": "Western Europe",
+      "Q": 0.015706806282722526,
+      "true_risk_rate": 0.10256410256410256
+    }
+  ],
+  "evaluation": {
+    "total_high": 1242,
+    "naive_covered": 59,
+    "naive_rate": 0.04750402576489533,
+    "risk_aware_covered": 342,
+    "risk_aware_rate": 0.2753623188405797,
+    "rl_covered": 56,
+    "rl_rate": 0.04508856682769726
+  }
+}
