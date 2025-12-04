@@ -20,9 +20,9 @@ def get_data_path():
     if os.path.exists(CSV_PATH_FULL):
         print(f"[APP] Using FULL dataset at {CSV_PATH_FULL}")
         return CSV_PATH_FULL
-    elif os.path.exists(CV_PATH_SAMPLE := CSV_PATH_SAMPLE):
-        print(f"[APP] Using SAMPLE dataset at {CV_PATH_SAMPLE}")
-        return CV_PATH_SAMPLE
+    elif os.path.exists(CSV_PATH_SAMPLE):
+        print(f"[APP] Using SAMPLE dataset at {CSV_PATH_SAMPLE}")
+        return CSV_PATH_SAMPLE
     else:
         raise FileNotFoundError(
             f"Neither {CSV_PATH_FULL} nor {CSV_PATH_SAMPLE} found."
@@ -35,9 +35,14 @@ def load_dataset_for_ui():
       - region risk summary
       - dropdown options (regions, disaster types)
       - default form values
+      - scenario-level statistics
+      - approximate geo coordinates per region
     """
     path = get_data_path()
     df = pd.read_csv(path)
+
+    # Keep a copy for scenario stats
+    base_df = df.copy()
 
     # Drop rows without impact
     df = df.dropna(subset=[IMPACT_COL])
@@ -65,6 +70,23 @@ def load_dataset_for_ui():
         .reset_index(drop=True)
     )
 
+    # ---- approximate geo-coordinates per region (for map) ----
+    # Latitude/Longitude are strings in the dataset; convert to numeric where possible
+    df_geo = df_region.copy()
+    df_geo["Latitude_num"] = pd.to_numeric(df_geo.get("Latitude"), errors="coerce")
+    df_geo["Longitude_num"] = pd.to_numeric(df_geo.get("Longitude"), errors="coerce")
+
+    geo_group = (
+        df_geo.groupby("Region")[["Latitude_num", "Longitude_num"]]
+        .mean()
+        .reset_index()
+    )
+
+    region_risk = region_risk.merge(geo_group, on="Region", how="left")
+    region_risk.rename(
+        columns={"Latitude_num": "lat", "Longitude_num": "lon"}, inplace=True
+    )
+
     regions = sorted(df_region["Region"].dropna().unique().tolist())
     disaster_types = sorted(df["Disaster Type"].dropna().unique().tolist())
 
@@ -75,7 +97,7 @@ def load_dataset_for_ui():
     }
 
     print("[APP] Dataset loaded for UI elements.")
-    return region_risk, regions, disaster_types, default_values, int(len(df))
+    return region_risk, regions, disaster_types, default_values, int(len(df)), base_df
 
 
 def load_model_pipeline():
@@ -117,6 +139,39 @@ def get_region_stats(region_name: str | None, region_risk_df: pd.DataFrame):
         "high_impact": int(row["high_impact"]),
         "risk_rate": float(row["risk_rate"]),
     }
+
+
+def get_scenario_stats(year: int, region: str, dtype: str, df: pd.DataFrame):
+    """
+    Compute simple, understandable statistics from the dataset for the chosen scenario:
+      - Median Total Deaths
+      - Median No Injured
+      - Median Total Affected
+    using all historical events with the same Region and Disaster Type.
+    """
+    if "Region" not in df.columns or "Disaster Type" not in df.columns:
+        return None
+
+    subset = df.copy()
+    subset = subset[subset["Region"] == region]
+    subset = subset[subset["Disaster Type"] == dtype]
+
+    if subset.empty:
+        return None
+
+    stats = {"n_events": int(len(subset))}
+
+    def median_if(col):
+        if col in subset.columns:
+            val = subset[col].dropna().median()
+            return None if pd.isna(val) else float(val)
+        return None
+
+    stats["median_deaths"] = median_if("Total Deaths")
+    stats["median_injured"] = median_if("No Injured")
+    stats["median_affected"] = median_if("Total Affected")
+
+    return stats
 
 
 def interpret_risk(prob: float):
@@ -191,7 +246,14 @@ def run_allocation_sim(region_risk_df: pd.DataFrame, teams: int, years: int, see
 
 
 # ---------- Load everything at startup ----------
-REGION_RISK, REGIONS, DISASTER_TYPES, DEFAULT_VALUES, N_SAMPLES_UI = load_dataset_for_ui()
+(
+    REGION_RISK,
+    REGIONS,
+    DISASTER_TYPES,
+    DEFAULT_VALUES,
+    N_SAMPLES_UI,
+    DISASTER_DF,
+) = load_dataset_for_ui()
 PIPELINE = load_model_pipeline()
 MODEL_METRICS = load_metrics()
 
@@ -203,6 +265,8 @@ INDEX_HTML = """
 <html>
 <head>
     <title>INTELLIRESCUE: INTELLIGENT DISASTER MITIGATION SYSTEM</title>
+    <!-- Plotly for geographic map -->
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
     <style>
         body {
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -362,15 +426,10 @@ INDEX_HTML = """
             background: rgba(15,23,42,0.95);
             font-size: 0.93rem;
         }
-        .low-risk {
-            border-color: #22c55e;
-        }
-        .medium-risk {
-            border-color: #facc15;
-        }
-        .high-risk {
-            border-color: #f97316;
-        }
+        .low-risk { border-color: #22c55e; }
+        .medium-risk { border-color: #facc15; }
+        .high-risk { border-color: #f97316; }
+
         .result-title {
             font-size: 1.0rem;
             margin: 0 0 4px 0;
@@ -454,6 +513,11 @@ INDEX_HTML = """
         a:hover {
             text-decoration: underline;
         }
+        /* map container */
+        #risk-map {
+            width: 100%;
+            height: 340px;
+        }
     </style>
 </head>
 <body>
@@ -474,11 +538,6 @@ INDEX_HTML = """
             <div>
                 <div class="card">
                     <h2 class="card-title">SCENARIO FORECAST</h2>
-                    <p class="card-subtitle">
-                        Configure a hypothetical disaster scenario (including future years). IntelliRescue uses
-                        an XGBoost risk model trained on historical disasters to estimate whether the event is likely
-                        to become <span class="highlight">high-impact</span> (top events by deaths).
-                    </p>
 
                     <form method="post" action="/predict">
                         <label for="year">Year</label>
@@ -498,7 +557,7 @@ INDEX_HTML = """
                             {% endfor %}
                         </select>
 
-                        <button type="submit" class="btn">
+                        <button type="submit" class="btn" style="margin-top:8px;">
                             <span class="btn-icon"></span>
                             RUN RISK CHECK
                         </button>
@@ -529,20 +588,52 @@ INDEX_HTML = """
                         <div id="scenario-details"
                              style="display:none; margin-top: 10px; padding: 9px 10px; border-radius: 10px; background:#020617; border: 1px dashed #4b5563; font-size: 0.85rem;">
                             <p style="margin-top:0; margin-bottom:6px; color:#9ca3af;">
-                                Scenario inputs used by the model:
+                                Scenario inputs and typical historical impact for similar events:
                             </p>
                             <table>
                                 <tr><th>Feature</th><th>Value</th></tr>
-                                <tr><td>Year</td><td>{{ detail_year }}</td></tr>
+                                <tr><td>Scenario Year</td><td>{{ detail_year }}</td></tr>
                                 <tr><td>Region</td><td>{{ detail_region }}</td></tr>
                                 <tr><td>Disaster Type</td><td>{{ detail_disaster_type }}</td></tr>
+
+                                {% if scenario_stats %}
+                                    <tr>
+                                        <td>Historical events (same region &amp; type)</td>
+                                        <td>{{ scenario_stats.n_events }}</td>
+                                    </tr>
+                                    {% if scenario_stats.median_deaths is not none %}
+                                    <tr>
+                                        <td>Typical total deaths (median)</td>
+                                        <td>{{ scenario_stats.median_deaths | round(1) }}</td>
+                                    </tr>
+                                    {% endif %}
+                                    {% if scenario_stats.median_injured is not none %}
+                                    <tr>
+                                        <td>Typical total injured (median)</td>
+                                        <td>{{ scenario_stats.median_injured | round(1) }}</td>
+                                    </tr>
+                                    {% endif %}
+                                    {% if scenario_stats.median_affected is not none %}
+                                    <tr>
+                                        <td>Typical people affected / displaced (median)</td>
+                                        <td>{{ scenario_stats.median_affected | round(1) }}</td>
+                                    </tr>
+                                    {% endif %}
+                                {% else %}
+                                    <tr>
+                                        <td colspan="2">
+                                            No matching historical events found in the dataset for this region
+                                            and disaster type.
+                                        </td>
+                                    </tr>
+                                {% endif %}
                             </table>
                         </div>
                     {% endif %}
                 </div>
             </div>
 
-            <!-- RIGHT: Historical insights + simulation + emergency resources -->
+            <!-- RIGHT: Historical insights + map + resources + simulation + model status -->
             <div>
                 <div class="card">
                     <h2 class="card-title">REGION RISK SNAPSHOT</h2>
@@ -573,6 +664,76 @@ INDEX_HTML = """
                     {% else %}
                         <p>No historical stats available for this region.</p>
                     {% endif %}
+                </div>
+
+                <!-- GLOBAL RISK MAP -->
+                <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">GLOBAL RISK MAP</h2>
+                    <p class="card-subtitle">
+                        Approximate world map showing historical regions coloured by high-impact rate.
+                        Larger, brighter points indicate regions with more frequent severe disasters.
+                    </p>
+                    <div id="risk-map"></div>
+                    <p style="margin-top:6px; font-size:0.78rem; color:#9ca3af;">
+                        Note: Coordinates are approximated from recorded event centroids per region.
+                        This visual is intended for communication / education, not precise navigation.
+                    </p>
+                </div>
+
+                <!-- EMERGENCY RESPONSE RESOURCES (collapsible) -->
+                <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">EMERGENCY RESPONSE RESOURCES</h2>
+                    <p class="card-subtitle">
+                        Practical guidance that emergency planners and citizens can use alongside IntelliRescue’s
+                        predictions. Adapt this section to your local city / campus guidelines.
+                    </p>
+
+                    <button type="button"
+                            id="toggle-resources-btn"
+                            class="btn btn-secondary"
+                            onclick="toggleSection('resources-content','toggle-resources-btn','Show emergency response resources','Hide emergency response resources')">
+                        Show emergency response resources
+                    </button>
+
+                    <div id="resources-content" style="display:none; margin-top:10px;">
+                        <h3 style="margin-top:4px; margin-bottom:4px; font-size:0.9rem;">Before a disaster (Preparedness)</h3>
+                        <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                            <li>Create a basic emergency kit: water, non-perishable food, torch, power bank, first-aid box, essential medicines, copies of ID cards.</li>
+                            <li>Keep a small “grab-and-go” bag ready near the door for fast evacuation.</li>
+                            <li>Agree on a common family / team meeting point if phones stop working.</li>
+                            <li>Save local emergency numbers and nearby hospital numbers on your phone.</li>
+                        </ul>
+
+                        <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">During a disaster (Immediate response)</h3>
+                        <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                            <li>Follow official warnings and evacuation orders – do not wait “to confirm” if the area is marked high risk.</li>
+                            <li>Flooding: avoid walking or driving through water; even shallow fast water can sweep vehicles away.</li>
+                            <li>Earthquakes: <b>Drop, Cover, Hold On</b> – drop low, cover your head and neck, hold onto sturdy furniture away from windows.</li>
+                            <li>Fire / smoke: stay low, cover your nose and mouth with cloth, exit by stairs (never lifts), and close doors behind you.</li>
+                        </ul>
+
+                        <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">After a disaster</h3>
+                        <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                            <li>Check yourself and others for injuries; call emergency services for serious injuries.</li>
+                            <li>Stay away from damaged buildings, fallen electric lines, and unstable bridges.</li>
+                            <li>Use SMS / data messages instead of phone calls to avoid overloading networks.</li>
+                            <li>Listen to local authorities for information about safe shelters, medical camps, and relief distribution.</li>
+                        </ul>
+
+                        <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">Important contacts (to customise)</h3>
+                        <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
+                            <li><b>Local emergency number:</b> 1 0 X (example – replace with your country’s number).</li>
+                            <li><b>City disaster control room:</b> add phone and email for your city / campus.</li>
+                            <li><b>Nearest major hospital:</b> add at least 2–3 hospital contacts.</li>
+                            <li><b>College / organisation helpline:</b> add your institute’s emergency contact.</li>
+                        </ul>
+
+                        <p style="margin-top:8px; font-size:0.8rem; color:#9ca3af;">
+                            IntelliRescue can highlight <span class="highlight">where</span> high-impact events are likely.
+                            These emergency response guidelines help decide <span class="highlight">how people and teams should react</span>
+                            when a warning is issued.
+                        </p>
+                    </div>
                 </div>
 
                 <div class="card" style="margin-top:14px;">
@@ -673,52 +834,6 @@ INDEX_HTML = """
                         {% endif %}
                     </div>
                 </div>
-
-                <div class="card" style="margin-top:14px;">
-                    <h2 class="card-title">EMERGENCY RESPONSE RESOURCES</h2>
-                    <p class="card-subtitle">
-                        Practical guidance that emergency planners and citizens can use alongside IntelliRescue’s
-                        predictions. This content is generic – it should be adapted to your city / campus guidelines.
-                    </p>
-
-                    <h3 style="margin-top:4px; margin-bottom:4px; font-size:0.9rem;">Before a disaster (Preparedness)</h3>
-                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
-                        <li>Create a basic emergency kit: water, non-perishable food, torch, power bank, first-aid box, essential medicines, copies of ID cards.</li>
-                        <li>Keep a small “grab-and-go” bag ready near the door for fast evacuation.</li>
-                        <li>Agree on a common family / team meeting point if phones stop working.</li>
-                        <li>Save local emergency numbers and nearby hospital numbers on your phone.</li>
-                    </ul>
-
-                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">During a disaster (Immediate response)</h3>
-                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
-                        <li>Follow official warnings and evacuation orders – do not wait “to confirm” if the area is marked high risk.</li>
-                        <li>Flooding: avoid walking or driving through water; even shallow fast water can sweep vehicles away.</li>
-                        <li>Earthquakes: <b>Drop, Cover, Hold On</b> – drop low, cover your head and neck, hold onto sturdy furniture away from windows.</li>
-                        <li>Fire / smoke: stay low, cover your nose and mouth with cloth, exit by stairs (never lifts), and close doors behind you.</li>
-                    </ul>
-
-                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">After a disaster</h3>
-                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
-                        <li>Check yourself and others for injuries; call emergency services for serious injuries.</li>
-                        <li>Stay away from damaged buildings, fallen electric lines, and unstable bridges.</li>
-                        <li>Use SMS / data messages instead of phone calls to avoid overloading networks.</li>
-                        <li>Listen to local authorities for information about safe shelters, medical camps, and relief distribution.</li>
-                    </ul>
-
-                    <h3 style="margin-top:8px; margin-bottom:4px; font-size:0.9rem;">Important contacts (to customise)</h3>
-                    <ul style="margin-top:4px; padding-left:18px; font-size:0.86rem;">
-                        <li><b>Local emergency number:</b> 1 0 X (example – replace with your country’s number).</li>
-                        <li><b>City disaster control room:</b> add phone and email for your city / campus.</li>
-                        <li><b>Nearest major hospital:</b> add at least 2–3 hospital contacts.</li>
-                        <li><b>College / organisation helpline:</b> add your institute’s emergency contact.</li>
-                    </ul>
-
-                    <p style="margin-top:8px; font-size:0.8rem; color:#9ca3af;">
-                        IntelliRescue can highlight <span class="highlight">where</span> high-impact events are likely.
-                        These emergency response guidelines help decide <span class="highlight">how people and teams should react</span>
-                        when a warning is issued.
-                    </p>
-                </div>
             </div>
         </div>
     </div>
@@ -737,6 +852,72 @@ INDEX_HTML = """
                 if (button && showLabel) button.textContent = showLabel;
             }
         }
+
+        // ---- GLOBAL RISK MAP ----
+        const REGION_POINTS = {{ region_points_json | safe }};
+
+        document.addEventListener("DOMContentLoaded", function () {
+            const pts = REGION_POINTS.filter(p => p.lat !== null && p.lon !== null);
+            if (pts.length === 0) {
+                return;
+            }
+
+            const lats = pts.map(p => p.lat);
+            const lons = pts.map(p => p.lon);
+            const texts = pts.map(p =>
+                `${p.Region}<br>` +
+                `High-impact rate: ${(p.risk_rate * 100).toFixed(1)}%<br>` +
+                `Events: ${p.events} | High-impact: ${p.high_impact}`
+            );
+            const sizes = pts.map(p => 8 + 25 * p.risk_rate);  // bigger for higher risk
+            const colors = pts.map(p => p.risk_rate);          // colour scale by risk
+
+            const data = [{
+                type: "scattergeo",
+                mode: "markers",
+                lat: lats,
+                lon: lons,
+                text: texts,
+                hoverinfo: "text",
+                marker: {
+                    size: sizes,
+                    color: colors,
+                    colorscale: "Reds",
+                    cmin: 0,
+                    cmax: 0.5,
+                    colorbar: {
+                        title: "High-impact rate",
+                        ticksuffix: "",
+                        outlinewidth: 0
+                    },
+                    line: {
+                        color: "rgba(15,23,42,0.9)",
+                        width: 0.6
+                    },
+                    opacity: 0.9
+                }
+            }];
+
+            const layout = {
+                geo: {
+                    scope: "world",
+                    projection: { type: "natural earth" },
+                    showland: true,
+                    landcolor: "rgb(15,23,42)",
+                    oceancolor: "rgb(15,23,42)",
+                    showocean: true,
+                    coastlinecolor: "rgb(55,65,81)",
+                    countrycolor: "rgb(55,65,81)",
+                    lataxis: { showgrid: true, gridwidth: 0.2, range: [-60, 80], dtick: 20 },
+                    lonaxis: { showgrid: true, gridwidth: 0.2, range: [-180, 180], dtick: 60 }
+                },
+                margin: { t: 10, b: 0, l: 0, r: 0 },
+                paper_bgcolor: "rgba(0,0,0,0)",
+                plot_bgcolor: "rgba(0,0,0,0)",
+            };
+
+            Plotly.newPlot("risk-map", data, layout, {displayModeBar: false});
+        });
     </script>
 </body>
 </html>
@@ -753,6 +934,7 @@ def _render_index(
     sim_results=None,
     sim_teams=10,
     sim_years=50,
+    scenario_stats=None,
 ):
     top_regions = REGION_RISK.head(10).to_dict(orient="records")
 
@@ -764,6 +946,10 @@ def _render_index(
         dtype_val = DEFAULT_VALUES["Disaster Type"]
 
     region_stats = get_region_stats(region_val, REGION_RISK)
+
+    # Geo points for map
+    region_points_df = REGION_RISK[["Region", "risk_rate", "lat", "lon", "events", "high_impact"]]
+    region_points = json.dumps(region_points_df.to_dict(orient="records"))
 
     return render_template_string(
         INDEX_HTML,
@@ -781,10 +967,12 @@ def _render_index(
         detail_year=year_val,
         detail_region=region_val,
         detail_disaster_type=dtype_val,
+        scenario_stats=scenario_stats,
         region_stats=region_stats,
         sim_results=sim_results,
         sim_teams=sim_teams,
         sim_years=sim_years,
+        region_points_json=region_points,
     )
 
 
@@ -806,12 +994,15 @@ def predict():
     proba = float(PIPELINE.predict_proba(X_input)[0, 1])
     risk_label, risk_class = interpret_risk(proba)
 
+    scenario_stats = get_scenario_stats(year_val, region_val, dtype_val, DISASTER_DF)
+
     print(
         "[PREDICT]",
         "Year=", year_val,
         "| Region=", region_val,
         "| Type=", dtype_val,
         "-> proba=", proba,
+        "| scenario_stats=", scenario_stats,
     )
 
     return _render_index(
@@ -821,6 +1012,7 @@ def predict():
         year_val=year_val,
         region_val=region_val,
         dtype_val=dtype_val,
+        scenario_stats=scenario_stats,
     )
 
 
@@ -850,6 +1042,7 @@ def simulate():
         sim_results=sim_results,
         sim_teams=sim_teams,
         sim_years=sim_years,
+        scenario_stats=None,
     )
 
 
