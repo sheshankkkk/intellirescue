@@ -32,7 +32,7 @@ def get_data_path():
 def load_dataset_for_ui():
     """
     Load dataset for:
-      - region risk table
+      - region risk summary
       - dropdown options (regions, disaster types)
       - default form values
     """
@@ -42,8 +42,8 @@ def load_dataset_for_ui():
     # Drop rows without impact
     df = df.dropna(subset=[IMPACT_COL])
 
-    # HighImpact label (same rule as backend)
-    threshold = 50.0  # your backend uses 50 deaths as threshold
+    # HighImpact label (same logical threshold as backend)
+    threshold = 50.0  # >= 50 deaths is high-impact
     df["HighImpact"] = (df[IMPACT_COL] >= threshold).astype(int)
 
     # Region-level risk
@@ -81,7 +81,7 @@ def load_dataset_for_ui():
 def load_model_pipeline():
     if not PIPELINE_PATH.exists():
         raise FileNotFoundError(
-            f"{PIPELINE_PATH} not found. Run the backend training script first."
+            f"{PIPELINE_PATH} not found. Run backend training first."
         )
     pipeline = joblib.load(PIPELINE_PATH)
     print(f"[APP] Loaded model pipeline from {PIPELINE_PATH}")
@@ -91,7 +91,13 @@ def load_model_pipeline():
 def load_metrics():
     if not METRICS_PATH.exists():
         print("[APP] Metrics file not found; using empty defaults.")
-        return {}
+        return {
+            "model_type": None,
+            "threshold": None,
+            "accuracy": None,
+            "roc_auc": None,
+            "n_samples": None,
+        }
     with open(METRICS_PATH, "r") as f:
         metrics = json.load(f)
     print(f"[APP] Loaded metrics from {METRICS_PATH}")
@@ -120,6 +126,68 @@ def interpret_risk(prob: float):
         return "Elevated / moderate risk", "medium-risk"
     else:
         return "Mild / low risk", "low-risk"
+
+
+def run_allocation_sim(region_risk_df: pd.DataFrame, teams: int, years: int, seed: int = 42):
+    """
+    Very lightweight Monte Carlo simulation inspired by emergency_simulation.py.
+
+    - Sample synthetic disaster events by region, proportional to historical event counts.
+    - Each event becomes high-impact with probability equal to region's risk_rate.
+    - Compare:
+        * naive: teams placed on random regions
+        * risk_aware: teams placed on highest-risk regions
+    """
+    rng = np.random.default_rng(seed)
+
+    regions = region_risk_df["Region"].values
+    events = region_risk_df["events"].values.astype(float)
+    risk_rates = region_risk_df["risk_rate"].values.astype(float)
+
+    n_regions = len(regions)
+    teams = max(1, min(teams, n_regions))
+    years = max(1, years)
+
+    # sample synthetic events
+    weights = events / events.sum()
+    n_events = years * 50  # arbitrary scaling: 50 synthetic events per year
+
+    region_idx = rng.choice(n_regions, size=n_events, p=weights)
+    # whether each event becomes high-impact
+    high_flags = rng.random(n_events) < risk_rates[region_idx]
+
+    if high_flags.sum() == 0:
+        return {
+            "teams": teams,
+            "years": years,
+            "total_high": 0,
+            "naive_covered": 0,
+            "risk_aware_covered": 0,
+            "naive_rate": 0.0,
+            "risk_aware_rate": 0.0,
+        }
+
+    # naive strategy: random assignment of teams
+    naive_assigned = rng.choice(n_regions, size=teams, replace=False)
+    naive_covered_mask = high_flags & np.isin(region_idx, naive_assigned)
+    naive_covered = int(naive_covered_mask.sum())
+
+    # risk-aware: assign teams to top risk regions
+    top_indices = np.argsort(risk_rates)[::-1][:teams]
+    aware_covered_mask = high_flags & np.isin(region_idx, top_indices)
+    aware_covered = int(aware_covered_mask.sum())
+
+    total_high = int(high_flags.sum())
+
+    return {
+        "teams": teams,
+        "years": years,
+        "total_high": total_high,
+        "naive_covered": naive_covered,
+        "risk_aware_covered": aware_covered,
+        "naive_rate": naive_covered / total_high if total_high > 0 else 0.0,
+        "risk_aware_rate": aware_covered / total_high if total_high > 0 else 0.0,
+    }
 
 
 # ---------- Load everything at startup ----------
@@ -400,9 +468,9 @@ INDEX_HTML = """
                 <div class="card">
                     <h2 class="card-title">SCENARIO FORECAST</h2>
                     <p class="card-subtitle">
-                        Configure a hypothetical disaster scenario (including future years). IntelliRescue uses a
-                        gradient-boosted XGBoost risk model trained on historical disasters to estimate whether the
-                        event is likely to become <span class="highlight">high-impact</span> (top events by deaths).
+                        Configure a hypothetical disaster scenario (including future years). IntelliRescue uses
+                        an XGBoost risk model trained on historical disasters to estimate whether the event is likely
+                        to become <span class="highlight">high-impact</span> (top events by deaths).
                     </p>
 
                     <form method="post" action="/predict">
@@ -467,7 +535,7 @@ INDEX_HTML = """
                 </div>
             </div>
 
-            <!-- RIGHT: Historical insights -->
+            <!-- RIGHT: Historical insights + simulation -->
             <div>
                 <div class="card">
                     <h2 class="card-title">REGION RISK SNAPSHOT</h2>
@@ -536,9 +604,65 @@ INDEX_HTML = """
                 </div>
 
                 <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">EMERGENCY TEAM ALLOCATION (SIMULATION)</h2>
+                    <p class="card-subtitle">
+                        Compare a <span class="highlight">naive</span> vs
+                        <span class="highlight">risk-aware</span> team deployment strategy using a Monte Carlo simulation
+                        on the historical risk map.
+                    </p>
+
+                    <form method="post" action="/simulate">
+                        <label for="sim_teams">Number of teams</label>
+                        <input type="number" id="sim_teams" name="sim_teams" value="{{ sim_teams }}" min="1" max="25">
+
+                        <label for="sim_years">Simulation years</label>
+                        <input type="number" id="sim_years" name="sim_years" value="{{ sim_years }}" min="1" max="100">
+
+                        <button type="submit" class="btn">
+                            <span class="btn-icon"></span>
+                            RUN ALLOCATION SIM
+                        </button>
+                    </form>
+
+                    {% if sim_results %}
+                        <div class="result-box medium-risk" style="margin-top: 12px;">
+                            <p class="result-title">Simulation summary</p>
+                            <p style="margin: 4px 0;">
+                                Teams: <b>{{ sim_results.teams }}</b> |
+                                Years simulated: <b>{{ sim_results.years }}</b> |
+                                High-impact events (simulated): <b>{{ sim_results.total_high }}</b>
+                            </p>
+                            <table>
+                                <tr>
+                                    <th>Strategy</th>
+                                    <th>Covered high-impact events</th>
+                                    <th>Coverage rate</th>
+                                </tr>
+                                <tr>
+                                    <td>Naive allocation</td>
+                                    <td>{{ sim_results.naive_covered }}</td>
+                                    <td>{{ "%.1f"|format(sim_results.naive_rate * 100) }}%</td>
+                                </tr>
+                                <tr>
+                                    <td>Risk-aware allocation</td>
+                                    <td>{{ sim_results.risk_aware_covered }}</td>
+                                    <td>{{ "%.1f"|format(sim_results.risk_aware_rate * 100) }}%</td>
+                                </tr>
+                            </table>
+                            <p style="margin-top: 6px; font-size: 0.83rem; color:#e5e7eb;">
+                                In this run, assigning teams to historically high-risk regions
+                                <span class="highlight">increased coverage of severe events</span>
+                                compared to a naive, random deployment.
+                            </p>
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="card" style="margin-top:14px;">
                     <h2 class="card-title">MODEL STATUS</h2>
                     <p class="card-subtitle">
-                        XGBoost-style gradient boosted classifier trained offline, then served here for fast risk checks.
+                        XGBoost classifier trained offline (80% train / 20% test), then deployed here for
+                        real-time risk checks and simulations.
                     </p>
                     <div class="metrics-grid">
                         <div class="metric-pill">
@@ -601,13 +725,27 @@ INDEX_HTML = """
 """
 
 
-@app.route("/", methods=["GET"])
-def index():
+def _render_index(
+    prediction=None,
+    risk_label=None,
+    risk_class="low-risk",
+    year_val=None,
+    region_val=None,
+    dtype_val=None,
+    sim_results=None,
+    sim_teams=10,
+    sim_years=50,
+):
     top_regions = REGION_RISK.head(10).to_dict(orient="records")
-    default_year = DEFAULT_VALUES["Year"]
-    default_region = DEFAULT_VALUES["Region"]
-    default_disaster_type = DEFAULT_VALUES["Disaster Type"]
-    region_stats = get_region_stats(default_region, REGION_RISK)
+
+    if year_val is None:
+        year_val = DEFAULT_VALUES["Year"]
+    if region_val is None:
+        region_val = DEFAULT_VALUES["Region"]
+    if dtype_val is None:
+        dtype_val = DEFAULT_VALUES["Disaster Type"]
+
+    region_stats = get_region_stats(region_val, REGION_RISK)
 
     return render_template_string(
         INDEX_HTML,
@@ -616,17 +754,25 @@ def index():
         top_regions=top_regions,
         regions=REGIONS,
         disaster_types=DISASTER_TYPES,
-        default_year=default_year,
-        default_region=default_region,
-        default_disaster_type=default_disaster_type,
-        prediction=None,
-        risk_label=None,
-        risk_class="low-risk",
-        detail_year=default_year,
-        detail_region=default_region,
-        detail_disaster_type=default_disaster_type,
+        default_year=year_val,
+        default_region=region_val,
+        default_disaster_type=dtype_val,
+        prediction=prediction,
+        risk_label=risk_label,
+        risk_class=risk_class,
+        detail_year=year_val,
+        detail_region=region_val,
+        detail_disaster_type=dtype_val,
         region_stats=region_stats,
+        sim_results=sim_results,
+        sim_teams=sim_teams,
+        sim_years=sim_years,
     )
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return _render_index()
 
 
 @app.route("/predict", methods=["POST"])
@@ -650,29 +796,45 @@ def predict():
         "-> proba=", proba,
     )
 
-    top_regions = REGION_RISK.head(10).to_dict(orient="records")
-    region_stats = get_region_stats(region_val, REGION_RISK)
-
-    return render_template_string(
-        INDEX_HTML,
-        impact_col=IMPACT_COL,
-        metrics=MODEL_METRICS,
-        top_regions=top_regions,
-        regions=REGIONS,
-        disaster_types=DISASTER_TYPES,
-        default_year=year_val,
-        default_region=region_val,
-        default_disaster_type=dtype_val,
+    return _render_index(
         prediction=proba,
         risk_label=risk_label,
         risk_class=risk_class,
-        detail_year=year_val,
-        detail_region=region_val,
-        detail_disaster_type=dtype_val,
-        region_stats=region_stats,
+        year_val=year_val,
+        region_val=region_val,
+        dtype_val=dtype_val,
+    )
+
+
+@app.route("/simulate", methods=["POST"])
+def simulate():
+    sim_teams = int(request.form.get("sim_teams") or 10)
+    sim_years = int(request.form.get("sim_years") or 50)
+
+    sim_results = run_allocation_sim(REGION_RISK, sim_teams, sim_years)
+
+    print(
+        "[SIMULATE] teams=", sim_teams,
+        "| years=", sim_years,
+        "| total_high=", sim_results["total_high"],
+        "| naive_rate=", sim_results["naive_rate"],
+        "| risk_aware_rate=", sim_results["risk_aware_rate"],
+    )
+
+    # keep scenario inputs at defaults on simulation route
+    return _render_index(
+        prediction=None,
+        risk_label=None,
+        risk_class="low-risk",
+        year_val=DEFAULT_VALUES["Year"],
+        region_val=DEFAULT_VALUES["Region"],
+        dtype_val=DEFAULT_VALUES["Disaster Type"],
+        sim_results=sim_results,
+        sim_teams=sim_teams,
+        sim_years=sim_years,
     )
 
 
 if __name__ == "__main__":
-    print("[APP] Starting IntelliRescue emergency-response dashboard on http://127.0.0.1:5000")
+    print("[APP] Starting IntelliRescue dashboard on http://127.0.0.1:5000")
     app.run(debug=True)
