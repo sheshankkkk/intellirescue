@@ -1,53 +1,22 @@
 import os
+import json
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
-
 from flask import Flask, request, render_template_string
-
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score
 
 # ---------------- CONFIG ----------------
 IMPACT_COL = "Total Deaths"
-
-NON_FEATURE_COLS = [
-    IMPACT_COL,
-    "Dis No",
-    "Event Name",
-    "Location",
-    "Geo Locations",
-    "Glide",
-]
-
 CSV_PATH_FULL = "data/disasters.csv"
 CSV_PATH_SAMPLE = "data/disasters_sample.csv"
 
-HIGH_IMPACT_QUANTILE = 0.75  # top 25% by deaths -> HighImpact
-
-# Features you want to show when user clicks "Show key model inputs"
-EXPLAIN_FEATURES = [
-    "Year",
-    "Seq",
-    "Aid Contribution",
-    "Dis Mag Value",
-    "Start Year",
-    "Start Month",
-    "Start Day",
-    "End Year",
-    "End Month",
-    "End Day",
-    "No Injured",
-    "No Affected",
-    "No Homeless",
-    "Total Affected",
-    "Reconstruction Costs ('000 US$')",
-]
-# ----------------------------------------
+PIPELINE_PATH = Path("models/disaster_risk_xgb.pkl")
+METRICS_PATH = Path("models/disaster_risk_metrics.json")
 
 
 def get_data_path():
-    """Return path to dataset (full or sample)."""
     if os.path.exists(CSV_PATH_FULL):
         print(f"[APP] Using FULL dataset at {CSV_PATH_FULL}")
         return CSV_PATH_FULL
@@ -60,23 +29,24 @@ def get_data_path():
         )
 
 
-def load_and_prepare_for_app():
+def load_dataset_for_ui():
     """
-    Load dataset, create HighImpact label, compute region risk,
-    train a RandomForest model (used for predictions), and
-    prepare defaults & feature names.
+    Load dataset for:
+      - region risk table
+      - dropdown options (regions, disaster types)
+      - default form values
     """
     path = get_data_path()
     df = pd.read_csv(path)
 
-    # Drop rows with missing impact
+    # Drop rows without impact
     df = df.dropna(subset=[IMPACT_COL])
 
-    # HighImpact label
-    threshold = df[IMPACT_COL].quantile(HIGH_IMPACT_QUANTILE)
+    # HighImpact label (same rule as backend)
+    threshold = 50.0  # your backend uses 50 deaths as threshold
     df["HighImpact"] = (df[IMPACT_COL] >= threshold).astype(int)
 
-    # Region-level risk statistics
+    # Region-level risk
     df_region = df.dropna(subset=["Region"])
     grouped = df_region.groupby("Region")
     counts = grouped["HighImpact"].count()
@@ -95,152 +65,45 @@ def load_and_prepare_for_app():
         .reset_index(drop=True)
     )
 
-    # Feature columns for model
-    cols_to_drop = NON_FEATURE_COLS + ["HighImpact"]
-    feature_cols_raw = [c for c in df.columns if c not in cols_to_drop]
-
-    X_raw = df[feature_cols_raw]
-    y = df["HighImpact"]
-
-    # One-hot encode categoricals
-    X = pd.get_dummies(X_raw, drop_first=True)
-    rf_feature_names = list(X.columns)
-
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    # RandomForest model
-    rf_model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=None,
-        random_state=42,
-        n_jobs=-1,
-        class_weight="balanced",
-    )
-    rf_model.fit(X_train, y_train)
-
-    y_proba = rf_model.predict_proba(X_test)[:, 1]
-    y_pred = (y_proba >= 0.5).astype(int)
-
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_proba)
-
-    metrics = {
-        "threshold": float(threshold),
-        "accuracy": float(acc),
-        "roc_auc": float(auc),
-        "n_samples": int(len(df)),
-    }
-
-    # Defaults for form fields
-    default_values = {}
-    for col in feature_cols_raw:
-        if pd.api.types.is_numeric_dtype(df[col]):
-            default_values[col] = float(df[col].median())
-        else:
-            default_values[col] = str(df[col].mode().iloc[0])
-
     regions = sorted(df_region["Region"].dropna().unique().tolist())
     disaster_types = sorted(df["Disaster Type"].dropna().unique().tolist())
 
-    print("[APP] Loaded dataset & trained RandomForest for web app.")
-    return (
-        metrics,
-        region_risk,
-        default_values,
-        feature_cols_raw,
-        regions,
-        disaster_types,
-        rf_model,
-        rf_feature_names,
-    )
+    default_values = {
+        "Year": int(df["Year"].median()),
+        "Region": df_region["Region"].mode().iloc[0],
+        "Disaster Type": df["Disaster Type"].mode().iloc[0],
+    }
+
+    print("[APP] Dataset loaded for UI elements.")
+    return region_risk, regions, disaster_types, default_values, int(len(df))
 
 
-# ---- Load data + model once at startup ----
-(
-    MODEL_METRICS,
-    REGION_RISK,
-    DEFAULT_VALUES,
-    FEATURE_COLS_RAW,
-    REGIONS,
-    DISASTER_TYPES,
-    RF_MODEL,
-    RF_FEATURE_NAMES,
-) = load_and_prepare_for_app()
+def load_model_pipeline():
+    if not PIPELINE_PATH.exists():
+        raise FileNotFoundError(
+            f"{PIPELINE_PATH} not found. Run the backend training script first."
+        )
+    pipeline = joblib.load(PIPELINE_PATH)
+    print(f"[APP] Loaded model pipeline from {PIPELINE_PATH}")
+    return pipeline
 
 
-def build_feature_vector_from_form(form_data):
-    """
-    Build a single feature vector for the RandomForest model from form data.
-    Also return a dictionary of key features with original values for explanation.
-    """
-    # Start from defaults for all columns
-    row = {col: DEFAULT_VALUES[col] for col in FEATURE_COLS_RAW}
-
-    # Overwrite with user inputs
-    if "Year" in row and form_data.get("year"):
-        row["Year"] = int(form_data.get("year"))
-
-    if "Region" in row and form_data.get("region"):
-        row["Region"] = form_data.get("region")
-
-    if "Disaster Type" in row and form_data.get("disaster_type"):
-        row["Disaster Type"] = form_data.get("disaster_type")
-
-    # Raw input (original-scale values)
-    df_input_raw = pd.DataFrame([row])
-
-    # One-hot encode to match training
-    df_input = pd.get_dummies(df_input_raw, drop_first=True)
-
-    # Ensure all RF features exist
-    for col in RF_FEATURE_NAMES:
-        if col not in df_input.columns:
-            df_input[col] = 0
-
-    # Reorder to RF feature order
-    df_input = df_input[RF_FEATURE_NAMES]
-
-    X_input = df_input.values.astype(float)
-
-    # Prepare key features (original scale) for explanation
-    feature_debug = []
-    for name in EXPLAIN_FEATURES:
-        if name in df_input_raw.columns:
-            val = df_input_raw.loc[0, name]
-            # Try to convert to float for numeric columns; keep as str otherwise
-            try:
-                val_clean = float(val)
-            except (TypeError, ValueError):
-                val_clean = str(val)
-            feature_debug.append({"name": name, "value": val_clean})
-
-    # Logging for debugging
-    print("\n[DEBUG] Scenario:")
-    print(
-        "Year:", form_data.get("year"),
-        "| Region:", form_data.get("region"),
-        "| Type:", form_data.get("disaster_type")
-    )
-    print("[DEBUG] Key features:")
-    for f in feature_debug:
-        print("  ", f["name"], "=", f["value"])
-    print("[DEBUG] ---------------------------\n")
-
-    return X_input, feature_debug
+def load_metrics():
+    if not METRICS_PATH.exists():
+        print("[APP] Metrics file not found; using empty defaults.")
+        return {}
+    with open(METRICS_PATH, "r") as f:
+        metrics = json.load(f)
+    print(f"[APP] Loaded metrics from {METRICS_PATH}")
+    return metrics
 
 
-def get_region_stats(region_name: str | None):
-    """Look up region stats from REGION_RISK."""
+def get_region_stats(region_name: str | None, region_risk_df: pd.DataFrame):
     if not region_name:
         return None
-
-    matches = REGION_RISK[REGION_RISK["Region"] == region_name]
+    matches = region_risk_df[region_risk_df["Region"] == region_name]
     if matches.empty:
         return None
-
     row = matches.iloc[0]
     return {
         "region": row["Region"],
@@ -250,8 +113,21 @@ def get_region_stats(region_name: str | None):
     }
 
 
-# ------------------------ FLASK APP ------------------------
+def interpret_risk(prob: float):
+    if prob >= 0.70:
+        return "Severe / very high risk", "high-risk"
+    elif prob >= 0.40:
+        return "Elevated / moderate risk", "medium-risk"
+    else:
+        return "Mild / low risk", "low-risk"
 
+
+# ---------- Load everything at startup ----------
+REGION_RISK, REGIONS, DISASTER_TYPES, DEFAULT_VALUES, N_SAMPLES_UI = load_dataset_for_ui()
+PIPELINE = load_model_pipeline()
+MODEL_METRICS = load_metrics()
+
+# ------------------------ FLASK APP ------------------------
 app = Flask(__name__)
 
 INDEX_HTML = """
@@ -264,341 +140,353 @@ INDEX_HTML = """
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             margin: 0;
             padding: 0;
-            background: radial-gradient(circle at top left, #e0f2fe 0, #f9fafb 45%, #eef2ff 100%);
-            color: #0f172a;
+            background: radial-gradient(circle at top left, #111827 0, #020617 40%, #1f2937 100%);
+            color: #e5e7eb;
         }
         .page {
-            max-width: 1150px;
+            max-width: 1200px;
             margin: 0 auto;
-            padding: 24px 20px 40px;
+            padding: 24px 18px 40px;
         }
-        h1 {
-            margin-bottom: 4px;
-            letter-spacing: 0.04em;
-            font-size: 1.4rem;
+        .header {
+            background: linear-gradient(90deg, #7f1d1d, #b91c1c, #f97316);
+            border-radius: 0 0 18px 18px;
+            padding: 18px 20px 22px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.65);
+            margin-bottom: 16px;
+        }
+        .title {
+            margin: 0;
+            font-size: 1.6rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
         }
         .subtitle {
-            margin-top: 0;
-            color: #4b5563;
-            font-size: 0.95rem;
-        }
-        .section-title {
-            margin-top: 24px;
-            margin-bottom: 4px;
-            font-size: 1.15rem;
-        }
-        .section-subtitle {
-            margin-top: 0;
-            color: #6b7280;
+            margin-top: 6px;
+            color: #fee2e2;
             font-size: 0.9rem;
         }
-        .header-card {
+        .badge-live {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(15,23,42,0.85);
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
             margin-top: 10px;
-            padding: 16px 18px;
-            background: rgba(255,255,255,0.9);
-            border-radius: 14px;
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
-            border: 1px solid rgba(148, 163, 184, 0.35);
+        }
+        .badge-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: #f97316;
+            box-shadow: 0 0 8px #fecaca;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(0, 3.2fr) minmax(0, 2.6fr);
+            gap: 18px;
         }
         .card {
-            margin-top: 14px;
+            background: radial-gradient(circle at top left, #111827, #020617);
+            border-radius: 14px;
             padding: 18px 20px;
-            background: #ffffff;
-            border-radius: 12px;
-            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
-            border: 1px solid #e5e7eb;
-            transition: transform 0.18s ease-out, box-shadow 0.18s ease-out;
-            animation: fadeUp 0.4s ease-out both;
+            border: 1px solid rgba(248, 113, 113, 0.25);
+            box-shadow: 0 8px 26px rgba(0,0,0,0.7);
+            position: relative;
+            overflow: hidden;
+            transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+        }
+        .card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at top right, rgba(248,113,113,0.20), transparent 60%);
+            opacity: 0.7;
+            pointer-events: none;
         }
         .card:hover {
             transform: translateY(-2px);
-            box-shadow: 0 14px 30px rgba(15, 23, 42, 0.12);
+            border-color: rgba(248, 113, 113, 0.6);
+            box-shadow: 0 14px 32px rgba(0,0,0,0.85);
         }
         .card-title {
-            margin-top: 0;
-            margin-bottom: 4px;
+            margin: 0;
             font-size: 1.05rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
         }
         .card-subtitle {
-            margin-top: 0;
-            margin-bottom: 10px;
-            color: #6b7280;
+            margin-top: 6px;
+            margin-bottom: 12px;
             font-size: 0.9rem;
+            color: #9ca3af;
         }
-
-        .layout {
-            display: grid;
-            grid-template-columns: minmax(0, 3fr) minmax(0, 2.4fr);
-            gap: 18px;
+        label {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #9ca3af;
         }
-
+        select, input[type=number] {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid #4b5563;
+            background: #020617;
+            color: #e5e7eb;
+            font-size: 0.92rem;
+            margin-bottom: 12px;
+        }
+        select:focus, input[type=number]:focus {
+            outline: none;
+            border-color: #f97316;
+            box-shadow: 0 0 0 1px #f97316;
+        }
+        .btn {
+            padding: 9px 18px;
+            border-radius: 999px;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, #ef4444, #f97316);
+            color: #0b1120;
+            box-shadow: 0 10px 24px rgba(248,113,113,0.6);
+            transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+        }
+        .btn:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.05);
+            box-shadow: 0 14px 32px rgba(248,113,113,0.8);
+        }
+        .btn-secondary {
+            background: #111827;
+            color: #f9fafb;
+            border: 1px solid #4b5563;
+            box-shadow: 0 6px 18px rgba(15,23,42,0.9);
+        }
+        .btn-secondary:hover {
+            border-color: #f97316;
+            box-shadow: 0 8px 22px rgba(15,23,42,1);
+        }
+        .btn-icon {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: #fecaca;
+        }
+        .result-box {
+            margin-top: 14px;
+            padding: 14px 14px;
+            border-radius: 12px;
+            border-left: 4px solid;
+            background: rgba(15,23,42,0.95);
+            font-size: 0.93rem;
+        }
+        .low-risk {
+            border-color: #22c55e;
+        }
+        .medium-risk {
+            border-color: #facc15;
+        }
+        .high-risk {
+            border-color: #f97316;
+        }
+        .result-title {
+            font-size: 1.0rem;
+            margin: 0 0 4px 0;
+        }
+        .highlight {
+            color: #f97316;
+        }
         table {
             border-collapse: collapse;
             width: 100%;
-            margin-top: 10px;
-            font-size: 0.9rem;
+            margin-top: 8px;
+            font-size: 0.85rem;
         }
         th, td {
-            border: 1px solid #e5e7eb;
+            border: 1px solid #4b5563;
             padding: 6px 8px;
             text-align: left;
         }
         th {
-            background-color: #f9fafb;
-            font-weight: 600;
+            background: #020617;
+            color: #f9fafb;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 0.75rem;
         }
-
-        .btn {
-            padding: 8px 18px;
-            border: none;
-            background: linear-gradient(135deg, #2563eb, #22c55e);
-            color: white;
-            border-radius: 999px;
-            cursor: pointer;
-            font-weight: 500;
-            letter-spacing: 0.01em;
-            box-shadow: 0 6px 14px rgba(37, 99, 235, 0.35);
-            transition: transform 0.15s ease-out, box-shadow 0.15s ease-out;
-        }
-        .btn:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.45);
-        }
-        .btn-secondary {
-            background: #4b5563;
-            box-shadow: 0 4px 10px rgba(75, 85, 99, 0.4);
-        }
-        .btn-secondary:hover {
-            box-shadow: 0 8px 18px rgba(75, 85, 99, 0.5);
-        }
-
-        .result-box {
-            margin-top: 12px;
-            padding: 12px 14px;
-            border-radius: 12px;
-            border-left: 4px solid;
-            font-size: 0.93rem;
-        }
-        .low-risk {
-            background-color: #ecfdf3;
-            border-color: #16a34a;
-        }
-        .medium-risk {
-            background-color: #fffbeb;
-            border-color: #f97316;
-        }
-        .high-risk {
-            background-color: #fef2f2;
-            border-color: #dc2626;
-        }
-
-        label {
-            display: inline-block;
-            width: 120px;
-            margin-bottom: 6px;
-            font-size: 0.92rem;
-        }
-        select, input[type=number] {
-            padding: 6px 8px;
-            width: 220px;
-            border-radius: 6px;
-            border: 1px solid #d1d5db;
-            font-size: 0.92rem;
-        }
-
         .risk-chip {
-            display: inline-block;
-            padding: 2px 8px;
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 9px;
             border-radius: 999px;
-            font-size: 0.8em;
-            color: #fff;
-            margin-left: 6px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
         }
-        .risk-high { background-color: #dc2626; }
-        .risk-medium { background-color: #f97316; }
-        .risk-low { background-color: #16a34a; }
-
+        .chip-high {
+            background: rgba(248,113,113,0.18);
+            color: #fecaca;
+            border: 1px solid rgba(248,113,113,0.6);
+        }
+        .chip-med {
+            background: rgba(250,204,21,0.1);
+            color: #feecc7;
+            border: 1px solid rgba(250,204,21,0.6);
+        }
+        .chip-low {
+            background: rgba(34,197,94,0.12);
+            color: #bbf7d0;
+            border: 1px solid rgba(34,197,94,0.6);
+        }
         .metrics-grid {
             display: flex;
             flex-wrap: wrap;
-            gap: 10px;
+            gap: 8px;
             margin-top: 10px;
         }
         .metric-pill {
-            padding: 8px 10px;
+            padding: 7px 10px;
             border-radius: 999px;
-            background-color: #eff6ff;
-            font-size: 0.85rem;
+            background: #020617;
+            border: 1px solid #374151;
+            font-size: 0.8rem;
         }
         .metric-label {
-            font-size: 0.72rem;
+            font-size: 0.7rem;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #6b7280;
+            letter-spacing: 0.1em;
+            color: #9ca3af;
         }
         .metric-value {
             font-weight: 600;
+            color: #e5e7eb;
         }
-
-        @keyframes fadeUp {
-            from {
-                opacity: 0;
-                transform: translateY(6px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        @media (max-width: 800px) {
-            .page {
-                padding: 16px 12px 28px;
-            }
-            .layout {
-                grid-template-columns: minmax(0,1fr);
-            }
-            label {
-                width: 110px;
-            }
+        @media (max-width: 900px) {
+            .layout { grid-template-columns: minmax(0,1fr); }
+            .page { padding: 18px 12px 32px; }
         }
     </style>
 </head>
 <body>
-    <div class="page">
-        <div class="header-card">
-            <h1>INTELLIRESCUE: INTELLIGENT DISASTER MITIGATION SYSTEM</h1>
-            <p class="subtitle">
-                Use historical multi-disaster data to estimate high-impact risk and explore vulnerable regions.
-            </p>
+    <div class="header">
+        <h1 class="title">INTELLIRESCUE: INTELLIGENT DISASTER MITIGATION SYSTEM</h1>
+        <p class="subtitle">
+            AI-driven early warning and emergency resource planning using historical multi-disaster data.
+        </p>
+        <div class="badge-live">
+            <div class="badge-dot"></div>
+            LIVE RISK SIMULATOR
         </div>
+    </div>
 
-        <!-- MAIN TWO-COLUMN LAYOUT -->
+    <div class="page">
         <div class="layout">
-            <!-- LEFT COLUMN: FUTURE SCENARIO PREDICTION -->
+            <!-- LEFT: Future scenario prediction -->
             <div>
-                <h2 class="section-title">Future Scenario Prediction</h2>
-                <p class="section-subtitle">
-                    Configure a hypothetical disaster scenario (including future years) and estimate its probability of being high-impact.
-                </p>
-
                 <div class="card">
-                    <h3 class="card-title">Scenario Risk Forecast</h3>
+                    <h2 class="card-title">SCENARIO FORECAST</h2>
                     <p class="card-subtitle">
-                        Choose a year, region, and disaster type. IntelliRescue uses a RandomForest model trained on
-                        multi-decade EOSDIS/EM-DAT style data to classify whether a scenario is likely to be high-impact
-                        (top {{ (100 - HIGH_IMPACT_QUANTILE * 100) | round(0) }}% by deaths).
+                        Configure a hypothetical disaster scenario (including future years). IntelliRescue uses a
+                        gradient-boosted XGBoost risk model trained on historical disasters to estimate whether the
+                        event is likely to become <span class="highlight">high-impact</span> (top events by deaths).
                     </p>
 
                     <form method="post" action="/predict">
-                        <p>
-                            <label for="year">Year:</label>
-                            <input type="number" id="year" name="year" value="{{ default_year }}" min="1900" max="2100">
-                        </p>
-                        <p>
-                            <label for="region">Region:</label>
-                            <select id="region" name="region">
-                                {% for r in regions %}
-                                    <option value="{{ r }}" {% if r == default_region %}selected{% endif %}>{{ r }}</option>
-                                {% endfor %}
-                            </select>
-                        </p>
-                        <p>
-                            <label for="disaster_type">Disaster Type:</label>
-                            <select id="disaster_type" name="disaster_type">
-                                {% for t in disaster_types %}
-                                    <option value="{{ t }}" {% if t == default_disaster_type %}selected{% endif %}>{{ t }}</option>
-                                {% endfor %}
-                            </select>
-                        </p>
-                        <p style="margin-top: 12px;">
-                            <button type="submit" class="btn">Predict risk</button>
-                        </p>
+                        <label for="year">Year</label>
+                        <input type="number" id="year" name="year" value="{{ default_year }}" min="1970" max="2100">
+
+                        <label for="region">Region</label>
+                        <select id="region" name="region">
+                            {% for r in regions %}
+                                <option value="{{ r }}" {% if r == default_region %}selected{% endif %}>{{ r }}</option>
+                            {% endfor %}
+                        </select>
+
+                        <label for="disaster_type">Disaster Type</label>
+                        <select id="disaster_type" name="disaster_type">
+                            {% for t in disaster_types %}
+                                <option value="{{ t }}" {% if t == default_disaster_type %}selected{% endif %}>{{ t }}</option>
+                            {% endfor %}
+                        </select>
+
+                        <button type="submit" class="btn">
+                            <span class="btn-icon"></span>
+                            RUN RISK CHECK
+                        </button>
                     </form>
 
                     {% if prediction is not none %}
-                        {# classify risk level based on probability #}
-                        {% if prediction < 0.33 %}
-                            {% set risk_label = "Mild / Low risk" %}
-                            {% set risk_expl = "This scenario has relatively low likelihood of becoming a high-impact disaster, based on historical patterns." %}
-                            {% set risk_class = "low-risk" %}
-                        {% elif prediction < 0.66 %}
-                            {% set risk_label = "Moderate risk" %}
-                            {% set risk_expl = "This scenario has a moderate chance of becoming high-impact. Preparedness measures are recommended." %}
-                            {% set risk_class = "medium-risk" %}
-                        {% else %}
-                            {% set risk_label = "High risk / disaster-prone" %}
-                            {% set risk_expl = "This scenario is highly likely to become a high-impact disaster if it occurs. Strong preparedness and response capacity are critical." %}
-                            {% set risk_class = "high-risk" %}
-                        {% endif %}
-
                         <div class="result-box {{ risk_class }}">
-                            <p><b>Predicted probability of HIGH-IMPACT disaster:</b>
-                               {{ "%.2f"|format(prediction * 100) }}%</p>
+                            <p class="result-title">
+                                Predicted probability of <span class="highlight">HIGH-IMPACT</span> disaster:
+                                <b>{{ "%.2f"|format(prediction * 100) }}%</b>
+                            </p>
                             <p><b>Risk level:</b> {{ risk_label }}</p>
-                            <p>{{ risk_expl }}</p>
-                            <p style="font-size: 0.85rem; color: #4b5563;">
-                                This is a <b>scenario forecast</b>: you can choose future years (e.g. 2035) to estimate how prone a region is
-                                to severe disasters of a given type.
+                            <p style="margin-top: 6px; color: #d1d5db;">
+                                This scenario has a {{ risk_label|lower }} of escalating into a high-impact disaster,
+                                based on similar historical events in the selected region and hazard type.
                             </p>
                         </div>
 
-                        {% if feature_debug %}
-                            <p style="margin-top: 14px;">
-                                <button type="button"
-                                        id="toggle-features-btn"
-                                        class="btn btn-secondary"
-                                        onclick="toggleSection('model-input-details','toggle-features-btn','Show key model inputs','Hide key model inputs')">
-                                    Show key model inputs
-                                </button>
+                        <p style="margin-top: 14px;">
+                            <button type="button"
+                                    id="toggle-scenario-btn"
+                                    class="btn btn-secondary"
+                                    onclick="toggleSection('scenario-details','toggle-scenario-btn','Show scenario details','Hide scenario details')">
+                                Show scenario details
+                            </button>
+                        </p>
+
+                        <div id="scenario-details"
+                             style="display:none; margin-top: 10px; padding: 9px 10px; border-radius: 10px; background:#020617; border: 1px dashed #4b5563; font-size: 0.85rem;">
+                            <p style="margin-top:0; margin-bottom:6px; color:#9ca3af;">
+                                Scenario inputs used by the model:
                             </p>
-                            <div id="model-input-details"
-                                 style="margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: #f9fafb; border: 1px dashed #e5e7eb; font-size: 0.85rem; display: none;">
-                                <p style="margin-top: 0;"><b>Key input features used for this scenario</b></p>
-                                <p>
-                                    Original-scale values for a subset of important features that went into the risk model.
-                                </p>
-                                <table>
-                                    <tr>
-                                        <th>Feature name</th>
-                                        <th>Value (original scale)</th>
-                                    </tr>
-                                    {% for f in feature_debug %}
-                                        <tr>
-                                            <td>{{ f.name }}</td>
-                                            <td>{{ f.value }}</td>
-                                        </tr>
-                                    {% endfor %}
-                                </table>
-                            </div>
-                        {% endif %}
+                            <table>
+                                <tr><th>Feature</th><th>Value</th></tr>
+                                <tr><td>Year</td><td>{{ detail_year }}</td></tr>
+                                <tr><td>Region</td><td>{{ detail_region }}</td></tr>
+                                <tr><td>Disaster Type</td><td>{{ detail_disaster_type }}</td></tr>
+                            </table>
+                        </div>
                     {% endif %}
                 </div>
             </div>
 
-            <!-- RIGHT COLUMN: HISTORICAL DETAILS -->
+            <!-- RIGHT: Historical insights -->
             <div>
-                <h2 class="section-title">Historical Risk & Region Insights</h2>
-                <p class="section-subtitle">
-                    Understand how often regions have experienced high-impact disasters and how the model performs overall.
-                </p>
-
                 <div class="card">
-                    <h3 class="card-title">Selected Region History</h3>
+                    <h2 class="card-title">REGION RISK SNAPSHOT</h2>
                     <p class="card-subtitle">
-                        Summary of recorded disasters in the currently selected region.
+                        Historical footprint of recorded disasters in the selected region. High-impact events are those
+                        exceeding a severity threshold based on {{ impact_col }}.
                     </p>
+
                     {% if region_stats %}
                         {% set rr = region_stats.risk_rate %}
                         {% if rr >= 0.4 %}
-                            {% set chip_class = "risk-high" %}
-                            {% set chip_label = "High risk" %}
+                            {% set chip_class = "chip-high" %}
+                            {% set chip_label = "HIGH RISK REGION" %}
                         {% elif rr >= 0.2 %}
-                            {% set chip_class = "risk-medium" %}
-                            {% set chip_label = "Moderate risk" %}
+                            {% set chip_class = "chip-med" %}
+                            {% set chip_label = "ELEVATED RISK" %}
                         {% else %}
-                            {% set chip_class = "risk-low" %}
-                            {% set chip_label = "Lower risk" %}
+                            {% set chip_class = "chip-low" %}
+                            {% set chip_label = "LOWER RISK" %}
                         {% endif %}
                         <p>
                             <b>Region:</b> {{ region_stats.region }}
@@ -607,81 +495,87 @@ INDEX_HTML = """
                         <p><b>Total recorded disasters:</b> {{ region_stats.events }}</p>
                         <p><b>High-impact disasters:</b> {{ region_stats.high_impact }}</p>
                         <p><b>High-impact rate:</b> {{ "%.1f"|format(region_stats.risk_rate * 100) }}%</p>
-                        <p style="font-size: 0.86rem; color: #6b7280;">
-                            Based on historical records across all years and hazard types for this region.
-                        </p>
                     {% else %}
                         <p>No historical stats available for this region.</p>
                     {% endif %}
                 </div>
 
-                <div class="card">
-                    <h3 class="card-title">High-Risk Regions Explorer</h3>
+                <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">TOP HIGH-RISK REGIONS</h2>
                     <p class="card-subtitle">
-                        See which regions have the highest fraction of high-impact disasters.
+                        Ranked by fraction of disasters that historically became high-impact.
                     </p>
                     <p>
                         <button type="button"
-                                id="toggle-top-regions-btn"
+                                id="toggle-top-btn"
                                 class="btn btn-secondary"
-                                onclick="toggleSection('top-regions-section','toggle-top-regions-btn','Show top regions','Hide top regions')">
-                            Show top regions
+                                onclick="toggleSection('top-regions','toggle-top-btn','Show high-risk regions','Hide high-risk regions')">
+                            Show high-risk regions
                         </button>
                     </p>
-                    <div id="top-regions-section" style="display: none;">
+                    <div id="top-regions" style="display:none;">
                         <table>
                             <tr>
                                 <th>Rank</th>
                                 <th>Region</th>
                                 <th>Events</th>
-                                <th>High-impact events</th>
-                                <th>High-impact rate</th>
+                                <th>High-impact</th>
+                                <th>Rate</th>
                             </tr>
                             {% for row in top_regions %}
-                            <tr>
-                                <td>{{ loop.index }}</td>
-                                <td>{{ row.Region }}</td>
-                                <td>{{ row.events }}</td>
-                                <td>{{ row.high_impact }}</td>
-                                <td>{{ "%.1f"|format(row.risk_rate * 100) }}%</td>
-                            </tr>
+                                <tr>
+                                    <td>{{ loop.index }}</td>
+                                    <td>{{ row.Region }}</td>
+                                    <td>{{ row.events }}</td>
+                                    <td>{{ row.high_impact }}</td>
+                                    <td>{{ "%.1f"|format(row.risk_rate * 100) }}%</td>
+                                </tr>
                             {% endfor %}
                         </table>
                     </div>
                 </div>
 
-                <div class="card">
-                    <h3 class="card-title">Dataset & Model Summary</h3>
+                <div class="card" style="margin-top:14px;">
+                    <h2 class="card-title">MODEL STATUS</h2>
                     <p class="card-subtitle">
-                        How we define "high-impact" and how well the RandomForest performs on held-out data.
+                        XGBoost-style gradient boosted classifier trained offline, then served here for fast risk checks.
                     </p>
                     <div class="metrics-grid">
                         <div class="metric-pill">
                             <div class="metric-label">Impact column</div>
                             <div class="metric-value">{{ impact_col }}</div>
                         </div>
+                        {% if metrics.threshold is not none %}
                         <div class="metric-pill">
-                            <div class="metric-label">HighImpact threshold</div>
+                            <div class="metric-label">High-impact threshold</div>
                             <div class="metric-value">≥ {{ metrics.threshold | round(1) }} deaths</div>
                         </div>
+                        {% endif %}
+                        {% if metrics.n_samples is not none %}
                         <div class="metric-pill">
-                            <div class="metric-label">Samples</div>
+                            <div class="metric-label">Samples used</div>
                             <div class="metric-value">{{ metrics.n_samples }}</div>
                         </div>
+                        {% endif %}
+                        {% if metrics.accuracy is not none %}
                         <div class="metric-pill">
-                            <div class="metric-label">RF Accuracy</div>
+                            <div class="metric-label">Test accuracy</div>
                             <div class="metric-value">{{ (metrics.accuracy * 100) | round(1) }}%</div>
                         </div>
+                        {% endif %}
+                        {% if metrics.roc_auc is not none %}
                         <div class="metric-pill">
-                            <div class="metric-label">RF ROC-AUC</div>
+                            <div class="metric-label">Test ROC-AUC</div>
                             <div class="metric-value">{{ metrics.roc_auc | round(3) }}</div>
                         </div>
+                        {% endif %}
+                        {% if metrics.model_type %}
+                        <div class="metric-pill">
+                            <div class="metric-label">Model</div>
+                            <div class="metric-value">{{ metrics.model_type }}</div>
+                        </div>
+                        {% endif %}
                     </div>
-                    <p style="margin-top: 10px; font-size: 0.86rem; color: #6b7280;">
-                        HighImpact = 1 if <b>{{ impact_col }}</b> is above the
-                        {{ (HIGH_IMPACT_QUANTILE * 100) | round(0) }}th percentile of historical events
-                        (representing the most severe disasters in the dataset).
-                    </p>
                 </div>
             </div>
         </div>
@@ -692,9 +586,8 @@ INDEX_HTML = """
             const section = document.getElementById(sectionId);
             const button = document.getElementById(buttonId);
             if (!section) return;
-
-            const currentlyHidden = (section.style.display === "none" || section.style.display === "");
-            if (currentlyHidden) {
+            const hidden = (section.style.display === "none" || section.style.display === "");
+            if (hidden) {
                 section.style.display = "block";
                 if (button && hideLabel) button.textContent = hideLabel;
             } else {
@@ -711,10 +604,10 @@ INDEX_HTML = """
 @app.route("/", methods=["GET"])
 def index():
     top_regions = REGION_RISK.head(10).to_dict(orient="records")
-    default_year = 2000
-    default_region = REGION_RISK.loc[0, "Region"]
-    default_disaster_type = DISASTER_TYPES[0] if DISASTER_TYPES else ""
-    region_stats = get_region_stats(default_region)
+    default_year = DEFAULT_VALUES["Year"]
+    default_region = DEFAULT_VALUES["Region"]
+    default_disaster_type = DEFAULT_VALUES["Disaster Type"]
+    region_stats = get_region_stats(default_region, REGION_RISK)
 
     return render_template_string(
         INDEX_HTML,
@@ -727,38 +620,38 @@ def index():
         default_region=default_region,
         default_disaster_type=default_disaster_type,
         prediction=None,
-        feature_debug=None,
+        risk_label=None,
+        risk_class="low-risk",
+        detail_year=default_year,
+        detail_region=default_region,
+        detail_disaster_type=default_disaster_type,
         region_stats=region_stats,
-        HIGH_IMPACT_QUANTILE=HIGH_IMPACT_QUANTILE,
     )
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    if RF_MODEL is None:
-        return "RandomForest model not loaded.", 500
+    year_val = int(request.form.get("year") or DEFAULT_VALUES["Year"])
+    region_val = request.form.get("region") or DEFAULT_VALUES["Region"]
+    dtype_val = request.form.get("disaster_type") or DEFAULT_VALUES["Disaster Type"]
 
-    form = request.form
-    X_input, feature_debug = build_feature_vector_from_form(form)
-    proba = float(RF_MODEL.predict_proba(X_input)[0, 1])
+    X_input = pd.DataFrame(
+        [{"Year": year_val, "Region": region_val, "Disaster Type": dtype_val}]
+    )
 
-    # Debug log in terminal
+    proba = float(PIPELINE.predict_proba(X_input)[0, 1])
+    risk_label, risk_class = interpret_risk(proba)
+
     print(
-        "[PREDICT] year=",
-        form.get("year"),
-        "region=",
-        form.get("region"),
-        "type=",
-        form.get("disaster_type"),
-        "-> proba=",
-        proba,
+        "[PREDICT]",
+        "Year=", year_val,
+        "| Region=", region_val,
+        "| Type=", dtype_val,
+        "-> proba=", proba,
     )
 
     top_regions = REGION_RISK.head(10).to_dict(orient="records")
-    default_year = int(form.get("year") or 2000)
-    default_region = form.get("region")
-    default_disaster_type = form.get("disaster_type")
-    region_stats = get_region_stats(default_region)
+    region_stats = get_region_stats(region_val, REGION_RISK)
 
     return render_template_string(
         INDEX_HTML,
@@ -767,15 +660,19 @@ def predict():
         top_regions=top_regions,
         regions=REGIONS,
         disaster_types=DISASTER_TYPES,
-        default_year=default_year,
-        default_region=default_region,
-        default_disaster_type=default_disaster_type,
+        default_year=year_val,
+        default_region=region_val,
+        default_disaster_type=dtype_val,
         prediction=proba,
-        feature_debug=feature_debug,
+        risk_label=risk_label,
+        risk_class=risk_class,
+        detail_year=year_val,
+        detail_region=region_val,
+        detail_disaster_type=dtype_val,
         region_stats=region_stats,
-        HIGH_IMPACT_QUANTILE=HIGH_IMPACT_QUANTILE,
     )
 
 
 if __name__ == "__main__":
+    print("[APP] Starting IntelliRescue emergency-response dashboard on http://127.0.0.1:5000")
     app.run(debug=True)
