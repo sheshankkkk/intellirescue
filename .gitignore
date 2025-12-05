@@ -1,15 +1,20 @@
-# Virtual environment
-.venv/
+# Models
+models/*.pkl
+models/*.keras
+models/*.json
 
-# Python cache
+# Logs
+logs/**
+!logs/.gitkeep
+
+# Plots
+logs/plots/**
+logs/disaster_risk/**
+logs/simulation/**
+
+# Cache
 __pycache__/
 *.pyc
 
-# Mac system files
-.DS_Store
-
-# VS Code settings (optional)
-.vscode/
-
-# Large data files (optional)
-data/*.csv
+# Virtual environment
+.venv/

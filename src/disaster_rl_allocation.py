@@ -233,8 +233,8 @@ def evaluate_policies(region_risk: pd.DataFrame, agent: EpsilonGreedyAgent, n_ev
     Compare three strategies on a fresh Monte Carlo run:
 
     1. Naive: choose region at random (each event has a randomly protected region)
-    2. Risk-aware: always protect one of the top-k high-risk regions
-    3. RL policy: protect a region according to learned probabilities Q[a]
+    2. Risk-aware: always protect the region with highest true high-impact rate
+    3. RL policy: GREEDY w.r.t. learned Q-values (always protect region with max Q)
 
     We assume 1 team for simplicity; each event occurs in some region and we
     check if that region is the one being protected.
@@ -270,23 +270,18 @@ def evaluate_policies(region_risk: pd.DataFrame, agent: EpsilonGreedyAgent, n_ev
     naive_covered = int(((naive_choices == region_idx) & high_flags).sum())
 
     # strategy 2: risk-aware (always choose best arm by true risk_rate)
-    best_arm = int(np.argmax(risk_rates))
-    aware_choices = np.full(n_events, best_arm, dtype=int)
+    best_arm_true = int(np.argmax(risk_rates))
+    aware_choices = np.full(n_events, best_arm_true, dtype=int)
     aware_covered = int(((aware_choices == region_idx) & high_flags).sum())
 
-    # strategy 3: RL policy (sample according to normalized Q-values, or argmax if all zeros)
+    # strategy 3: RL policy (GREEDY: always choose arm with max Q)
     Q = agent.Q.copy()
     if np.allclose(Q, 0.0):
         # no learning? fallback to uniform random
         rl_choices = rng.integers(0, n_arms, size=n_events)
     else:
-        # convert Q to probabilities with softmax-like transform
-        # (scale to avoid numerical issues)
-        temp = 1.0
-        Q_shifted = Q - Q.max()
-        probs = np.exp(Q_shifted / max(temp, 1e-8))
-        probs /= probs.sum()
-        rl_choices = rng.choice(n_arms, size=n_events, p=probs)
+        best_arm_rl = int(np.argmax(Q))
+        rl_choices = np.full(n_events, best_arm_rl, dtype=int)
 
     rl_covered = int(((rl_choices == region_idx) & high_flags).sum())
 
