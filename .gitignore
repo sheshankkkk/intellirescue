@@ -1,24 +1,39 @@
-# macOS
-.DS_Store
-
-# VS Code
-.vscode/
-
-# Data (DO NOT COMMIT DATASETS)
-data/
-
-# Logs
-logs/**
-!logs/.gitkeep
-
-# Models
-models/*.pkl
-models/*.keras
-models/*.json
-
-# Python cache
+# --- Python ---
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Virtual environment
+# --- Virtual environments ---
 .venv/
+venv/
+env/
+
+# --- VSCode ---
+.vscode/
+
+# --- macOS system files ---
+.DS_Store
+
+# --- Data files ---
+data/
+*.csv
+*.xlsx
+*.json
+
+# If you want to keep only small samples, whitelist:
+!data/disasters_sample.csv
+
+# --- Model artifacts ---
+models/
+*.pkl
+*.joblib
+*.h5
+*.keras
+
+# --- Logs & generated outputs ---
+logs/
+*.log
+
+# --- Flask temp files ---
+instance/
